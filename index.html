@@ -1,0 +1,471 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Sunflower</title>
+<style>
+  html, body {
+    margin: 0; padding: 0; background: #111; color: #eee;
+    font-family: -apple-system, Segoe UI, Roboto, sans-serif;
+    display: flex; flex-direction: column; align-items: center;
+    height: 100%;
+  }
+  #wrap { position: relative; width: 100%; max-width: 1280px; }
+  canvas { width: 100%; height: auto; display: block; border-radius: 6px; }
+  video { display: none; }
+  #hud {
+    position: absolute; top: 0; left: 0; right: 0; bottom: 0;
+    pointer-events: none;
+  }
+  #status {
+    position: absolute; top: 10px; left: 10px;
+    background: rgba(0,0,0,0.45); padding: 8px 12px; border-radius: 8px;
+    font-size: 13px; line-height: 1.5; max-width: 60%;
+  }
+  #startBtn {
+    margin-top: 16px; padding: 10px 22px; font-size: 15px; border-radius: 8px;
+    border: none; background: #ffb703; color: #222; cursor: pointer; font-weight: 600;
+  }
+  #startBtn:hover { background: #ffc93c; }
+  h1 { font-size: 18px; margin: 14px 0 4px; }
+  p.sub { font-size: 13px; color: #aaa; margin: 0 0 10px; }
+</style>
+</head>
+<body>
+  <h1>🌻 Sunflower Hand Tracker</h1>
+  <p class="sub">Spread thumb + index apart to grow the stem &middot; pinch together to bloom the flower</p>
+  <button id="startBtn">Start camera</button>
+  <div id="wrap" style="display:none;">
+    <video id="video" playsinline></video>
+    <canvas id="canvas" width="1280" height="720"></canvas>
+    <div id="hud">
+      <div id="status">Loading hand tracker…</div>
+    </div>
+  </div>
+
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+<script>
+// =============================================================================
+// GLOBAL CONSTANTS
+// =============================================================================
+const GOLDEN_ANGLE = Math.PI * (3.0 - Math.sqrt(5.0));
+
+const PALETTE = {
+  bgTop: 'rgb(90,175,235)',
+  bgBottom: 'rgb(245,235,170)',
+  ground: 'rgb(95,165,70)',
+  petalBase: 'rgb(235,140,0)',
+  petalMid: 'rgb(255,195,0)',
+  petalTip: 'rgb(255,230,60)',
+  petalShine: 'rgb(255,250,170)',
+  centerDark: 'rgb(50,30,18)',
+  centerRim: 'rgb(130,75,25)',
+  floretGold: 'rgb(255,205,0)',
+  stem: 'rgb(55,120,30)',
+  stemRim: 'rgb(140,220,90)',
+  leafDark: 'rgb(45,95,25)',
+  leafLight: 'rgb(70,160,55)',
+  particle: 'rgb(255,230,120)',
+  sun: 'rgb(255,250,225)',
+  sunGlow: 'rgb(255,235,170)',
+  cloud: 'rgb(240,245,250)'
+};
+
+function lerp(a, b, t) { return a + (b - a) * t; }
+function dist2d(p1, p2) { return Math.hypot(p1[0]-p2[0], p1[1]-p2[1]); }
+
+// =============================================================================
+// PARTICLES (rising pollen)
+// =============================================================================
+class ParticleSystem {
+  constructor(max=160) { this.max = max; this.particles = []; }
+  spawnPollen(pos, count=1) {
+    for (let i=0;i<count;i++) {
+      if (this.particles.length >= this.max) return;
+      this.particles.push({
+        x: pos[0], y: pos[1],
+        vx: (Math.random()-0.5)*2.4, vy: -Math.random()*2.5-0.5,
+        life: Math.random()*1.5+1.0, maxLife: 0, size: Math.random()*2+1
+      });
+      this.particles[this.particles.length-1].maxLife = this.particles[this.particles.length-1].life;
+    }
+  }
+  update(dt) {
+    this.particles = this.particles.filter(p => {
+      p.x += p.vx; p.y += p.vy; p.life -= dt;
+      return p.life > 0;
+    });
+  }
+  draw(ctx) {
+    for (const p of this.particles) {
+      const a = Math.max(0, p.life/p.maxLife);
+      ctx.globalAlpha = a;
+      ctx.fillStyle = PALETTE.particle;
+      ctx.beginPath(); ctx.arc(p.x, p.y, p.size+2, 0, Math.PI*2); ctx.fill();
+      ctx.beginPath(); ctx.arc(p.x, p.y, p.size, 0, Math.PI*2); ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+}
+
+// =============================================================================
+// BACKGROUND: SKY, GROUND, CLOUDS, SUN
+// =============================================================================
+function paintSky(ctx, w, h) {
+  const horizon = h * 0.80;
+  const grad = ctx.createLinearGradient(0,0,0,horizon);
+  grad.addColorStop(0, PALETTE.bgTop);
+  grad.addColorStop(1, PALETTE.bgBottom);
+  ctx.fillStyle = grad;
+  ctx.fillRect(0,0,w,horizon);
+  ctx.fillStyle = PALETTE.ground;
+  ctx.fillRect(0,horizon,w,h-horizon);
+}
+
+function makeClouds(w, h, count=6) {
+  const rng = mulberry32(42);
+  const clouds = [];
+  for (let i=0;i<count;i++) {
+    clouds.push({
+      x: rng()*w, y: h*0.05 + rng()*h*0.30,
+      scale: 0.7 + rng()*0.9, speed: 4 + rng()*6
+    });
+  }
+  return clouds;
+}
+function mulberry32(seed) {
+  return function() {
+    seed |= 0; seed = seed + 0x6D2B79F5 | 0;
+    let t = Math.imul(seed ^ seed >>> 15, 1 | seed);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+
+function drawCloudPuff(ctx, cx, cy, scale) {
+  const lobes = [[-1.0,0.05,1.0],[-0.4,-0.25,1.2],[0.3,-0.2,1.3],[0.9,0.05,1.0],[0.2,0.15,1.4]];
+  ctx.fillStyle = 'rgba(0,0,0,0.08)';
+  for (const [dx,dy,r] of lobes) {
+    ctx.beginPath();
+    ctx.arc(cx+dx*40*scale, cy+dy*40*scale+6, r*24*scale, 0, Math.PI*2);
+    ctx.fill();
+  }
+  ctx.fillStyle = PALETTE.cloud;
+  for (const [dx,dy,r] of lobes) {
+    ctx.beginPath();
+    ctx.arc(cx+dx*40*scale, cy+dy*40*scale, r*24*scale, 0, Math.PI*2);
+    ctx.fill();
+  }
+}
+
+function drawClouds(ctx, clouds, w, dt) {
+  for (const c of clouds) {
+    c.x = (c.x + c.speed*dt*6) % (w+200);
+    drawCloudPuff(ctx, c.x-100, c.y, c.scale);
+  }
+}
+
+function drawSun(ctx, cx, cy, radius) {
+  for (const [r,a] of [[radius*3.2,0.12],[radius*2.2,0.20],[radius*1.5,0.32]]) {
+    ctx.globalAlpha = a;
+    ctx.fillStyle = PALETTE.sunGlow;
+    ctx.beginPath(); ctx.arc(cx,cy,r,0,Math.PI*2); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+  ctx.strokeStyle = PALETTE.sunGlow;
+  ctx.lineWidth = 3;
+  for (let i=0;i<12;i++) {
+    const ang = (2*Math.PI/12)*i;
+    ctx.beginPath();
+    ctx.moveTo(cx+Math.cos(ang)*radius*1.3, cy+Math.sin(ang)*radius*1.3);
+    ctx.lineTo(cx+Math.cos(ang)*radius*1.9, cy+Math.sin(ang)*radius*1.9);
+    ctx.stroke();
+  }
+  ctx.fillStyle = PALETTE.sun;
+  ctx.beginPath(); ctx.arc(cx,cy,radius,0,Math.PI*2); ctx.fill();
+}
+
+// =============================================================================
+// SUNFLOWER DRAWING
+// =============================================================================
+function drawPetal(ctx, cx, cy, length, width, angle, fill, edge, shine) {
+  const local = [
+    [0,0], [-width*0.45, length*0.3], [-width*0.5, length*0.65],
+    [0, length], [width*0.5, length*0.65], [width*0.45, length*0.3]
+  ];
+  ctx.beginPath();
+  local.forEach(([lx,ly], i) => {
+    const rx = lx*Math.cos(angle) - ly*Math.sin(angle);
+    const ry = lx*Math.sin(angle) + ly*Math.cos(angle);
+    const px = cx+rx, py = cy-ry;
+    if (i===0) ctx.moveTo(px,py); else ctx.lineTo(px,py);
+  });
+  ctx.closePath();
+  ctx.fillStyle = fill; ctx.fill();
+  ctx.strokeStyle = edge; ctx.lineWidth = 1; ctx.stroke();
+
+  if (shine) {
+    const s0l = [-width*0.12, length*0.15], s1l = [-width*0.05, length*0.75];
+    const s0 = [cx + s0l[0]*Math.cos(angle) - s0l[1]*Math.sin(angle), cy - (s0l[0]*Math.sin(angle)+s0l[1]*Math.cos(angle))];
+    const s1 = [cx + s1l[0]*Math.cos(angle) - s1l[1]*Math.sin(angle), cy - (s1l[0]*Math.sin(angle)+s1l[1]*Math.cos(angle))];
+    ctx.strokeStyle = PALETTE.petalShine; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(s0[0],s0[1]); ctx.lineTo(s1[0],s1[1]); ctx.stroke();
+  }
+}
+
+function drawDisk(ctx, cx, cy, radius) {
+  const steps = 6;
+  for (let i=steps;i>=1;i--) {
+    const t = i/steps, r = radius*t, shade = lerp(1.15,0.55,t);
+    ctx.fillStyle = shadeColor(PALETTE.centerRim, shade);
+    ctx.beginPath(); ctx.arc(cx,cy,r,0,Math.PI*2); ctx.fill();
+  }
+  const numSeeds = 160;
+  for (let i=1;i<numSeeds;i++) {
+    const r = Math.sqrt(i/numSeeds)*radius, theta = i*GOLDEN_ANGLE;
+    const sx = cx + r*Math.cos(theta), sy = cy + r*Math.sin(theta);
+    if (r > radius*0.65) {
+      ctx.fillStyle = PALETTE.floretGold;
+      ctx.beginPath(); ctx.arc(sx,sy,2,0,Math.PI*2); ctx.fill();
+    } else {
+      ctx.fillStyle = PALETTE.centerDark;
+      const sr = Math.max(1, 2.5*(r/radius));
+      ctx.beginPath(); ctx.arc(sx,sy,sr,0,Math.PI*2); ctx.fill();
+    }
+  }
+  ctx.fillStyle = PALETTE.centerDark;
+  ctx.beginPath(); ctx.arc(cx,cy,radius*0.35,0,Math.PI*2); ctx.fill();
+  ctx.strokeStyle = 'rgba(20,20,25,0.9)'; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.arc(cx,cy,radius,0,Math.PI*2); ctx.stroke();
+}
+
+function shadeColor(rgbStr, factor) {
+  const m = rgbStr.match(/\d+/g).map(Number);
+  return `rgb(${Math.min(255,Math.round(m[0]*factor))},${Math.min(255,Math.round(m[1]*factor))},${Math.min(255,Math.round(m[2]*factor))})`;
+}
+
+function drawStemAndLeaves(ctx, bx, by, hx, hy, thickness, sway, scale) {
+  const midX = (bx+hx)/2 + sway*0.5, midY = (by+hy)/2;
+  const pts = [];
+  const segs = 25;
+  for (let i=0;i<=segs;i++) {
+    const t = i/segs;
+    const px = (1-t)**2*bx + 2*(1-t)*t*midX + t**2*hx;
+    const py = (1-t)**2*by + 2*(1-t)*t*midY + t**2*hy;
+    pts.push([px,py]);
+  }
+  ctx.strokeStyle = PALETTE.stem; ctx.lineWidth = thickness; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  ctx.beginPath(); pts.forEach(([x,y],i)=> i===0?ctx.moveTo(x,y):ctx.lineTo(x,y)); ctx.stroke();
+  ctx.strokeStyle = PALETTE.stemRim; ctx.lineWidth = Math.max(1, thickness/4);
+  ctx.beginPath(); pts.forEach(([x,y],i)=> i===0?ctx.moveTo(x-thickness/3,y):ctx.lineTo(x-thickness/3,y)); ctx.stroke();
+
+  const leafConfigs = [
+    {seg:0.3, deg:-60, mult:1.0, color:PALETTE.leafDark},
+    {seg:0.45, deg:55, mult:0.9, color:PALETTE.leafLight},
+    {seg:0.65, deg:-50, mult:0.75, color:PALETTE.leafDark},
+    {seg:0.8, deg:45, mult:0.6, color:PALETTE.leafLight}
+  ];
+  for (const l of leafConfigs) {
+    const idx = Math.floor(segs*l.seg);
+    const [bx2,by2] = pts[idx];
+    const angRad = (l.deg + sway*0.1) * Math.PI/180;
+    const length = 40*scale*l.mult, width = length*0.5;
+    ctx.fillStyle = l.color;
+    ctx.beginPath();
+    ctx.moveTo(bx2,by2);
+    ctx.lineTo(bx2+width*Math.cos(angRad-0.4), by2-width*Math.sin(angRad-0.4));
+    ctx.lineTo(bx2+length*Math.cos(angRad), by2-length*Math.sin(angRad));
+    ctx.lineTo(bx2+width*Math.cos(angRad+0.4), by2-width*Math.sin(angRad+0.4));
+    ctx.closePath(); ctx.fill();
+    ctx.strokeStyle = PALETTE.leafLight; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(bx2,by2); ctx.lineTo(bx2+length*Math.cos(angRad), by2-length*Math.sin(angRad)); ctx.stroke();
+  }
+}
+
+function drawSunflower(ctx, headPos, stemBase, bloom, sway, cfg) {
+  const [hx,hy] = headPos, [bx,by] = stemBase;
+  drawStemAndLeaves(ctx, bx, by, hx, hy, cfg.stemThickness, sway, cfg.scale);
+
+  const diskR = lerp(22,42,bloom)*cfg.scale;
+  const petalLen = lerp(30,95,bloom)*cfg.scale;
+  const petalW = lerp(12,26,bloom)*cfg.scale;
+  const n = cfg.numPetals;
+
+  const layers = [
+    {scale:1.0, color:PALETTE.petalBase, offset:0, shine:false},
+    {scale:0.9, color:PALETTE.petalMid, offset:Math.PI/n, shine:false},
+    {scale:0.78, color:PALETTE.petalTip, offset:(Math.PI/n)*0.5, shine:true}
+  ];
+  for (const layer of layers) {
+    const lLen = petalLen*layer.scale, lWid = petalW*layer.scale;
+    for (let i=0;i<n;i++) {
+      const angle = (2*Math.PI/n)*i + layer.offset + cfg.baseRotation;
+      const px = hx + diskR*0.75*Math.cos(angle);
+      const py = hy - diskR*0.75*Math.sin(angle);
+      drawPetal(ctx, px, py, lLen, lWid, angle-Math.PI/2, layer.color, PALETTE.petalBase, layer.shine);
+    }
+  }
+  drawDisk(ctx, hx, hy, diskR);
+}
+
+// =============================================================================
+// GARDEN
+// =============================================================================
+class SunflowerGarden {
+  constructor(w,h) {
+    this.w = w; this.h = h;
+    this.configs = [
+      {xRatio:0.50, minH:360, maxH:180, scale:1.25, numPetals:24, stemThickness:9, baseRotation:0.0},
+      {xRatio:0.24, minH:270, maxH:120, scale:0.95, numPetals:20, stemThickness:7, baseRotation:0.2},
+      {xRatio:0.76, minH:280, maxH:130, scale:1.05, numPetals:22, stemThickness:7, baseRotation:-0.3},
+      {xRatio:0.10, minH:190, maxH:60,  scale:0.80, numPetals:18, stemThickness:5, baseRotation:0.5},
+      {xRatio:0.90, minH:200, maxH:70,  scale:0.85, numPetals:18, stemThickness:5, baseRotation:-0.1}
+    ];
+    this.smoothControl = 0.5;
+  }
+  updateAndDraw(ctx, rawControl, t, windBias) {
+    this.smoothControl = lerp(this.smoothControl, rawControl, 0.08);
+    const bloomVal = this.smoothControl, growthVal = 1 - this.smoothControl;
+    const heads = [];
+    this.configs.forEach((cfg,i) => {
+      const baseX = this.w*cfg.xRatio, baseY = this.h;
+      const stemH = lerp(cfg.minH, cfg.maxH, growthVal);
+      const sway = Math.sin(t*1.8 + i*1.2)*12 + windBias;
+      const headX = baseX+sway, headY = baseY-stemH;
+      heads.push([headX,headY]);
+      drawSunflower(ctx, [headX,headY], [baseX,baseY], bloomVal, sway, cfg);
+    });
+    return heads;
+  }
+}
+
+// =============================================================================
+// POST-PROCESSING (approximate glow via a blurred bright-pass composited with 'lighter')
+// =============================================================================
+function applyGlowAndVignette(ctx, w, h, glowCanvas, glowCtx) {
+  glowCtx.clearRect(0,0,w,h);
+  glowCtx.filter = 'blur(14px) brightness(1.3)';
+  glowCtx.drawImage(ctx.canvas, 0, 0);
+  glowCtx.filter = 'none';
+
+  ctx.save();
+  ctx.globalCompositeOperation = 'lighter';
+  ctx.globalAlpha = 0.30;
+  ctx.drawImage(glowCanvas, 0, 0);
+  ctx.restore();
+
+  const grad = ctx.createRadialGradient(w/2,h/2,h*0.25, w/2,h/2,h*0.75);
+  grad.addColorStop(0, 'rgba(0,0,0,0)');
+  grad.addColorStop(1, 'rgba(0,0,0,0.22)');
+  ctx.fillStyle = grad;
+  ctx.fillRect(0,0,w,h);
+}
+
+// =============================================================================
+// MAIN
+// =============================================================================
+const video = document.getElementById('video');
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+const glowCanvas = document.createElement('canvas');
+glowCanvas.width = canvas.width; glowCanvas.height = canvas.height;
+const glowCtx = glowCanvas.getContext('2d');
+const statusEl = document.getElementById('status');
+
+const W = canvas.width, H = canvas.height;
+const garden = new SunflowerGarden(W,H);
+const particles = new ParticleSystem(160);
+const clouds = makeClouds(W,H);
+
+let rawControl = 0.5;
+let windForce = 0.0;
+let lastPinchRatio = 0.0;
+let pinchRatioMin = 0.12;
+let pinchRatioMax = 0.95;
+let lastTime = performance.now();
+let startTime = performance.now();
+
+function onResults(results) {
+  if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+    const lm = results.multiHandLandmarks[0];
+    // mirror x for natural selfie-view control (getUserMedia isn't flipped by default)
+    const mx = (p) => [ (1 - p.x) * W, p.y * H ];
+    const thumb = mx(lm[4]);
+    const index = mx(lm[8]);
+    const wrist = mx(lm[0]);
+    const mcp = mx(lm[9]);
+
+    const pinchDist = dist2d(thumb, index);
+    const handScale = Math.max(1.0, dist2d(wrist, mcp));
+    const pinchRatio = pinchDist / handScale;
+    lastPinchRatio = pinchRatio;
+
+    const span = Math.max(1e-4, pinchRatioMax - pinchRatioMin);
+    rawControl = Math.min(1, Math.max(0, (pinchRatio - pinchRatioMin) / span));
+
+    const tilt = Math.atan2(mcp[0]-wrist[0], -(mcp[1]-wrist[1])) * 180/Math.PI;
+    windForce = Math.min(1, Math.max(-1, tilt/45)) * 30;
+
+    statusEl.innerHTML =
+      `Bloom: ${Math.round(garden.smoothControl*100)}%<br>` +
+      `pinch ratio: ${pinchRatio.toFixed(2)} (min ${pinchRatioMin.toFixed(2)} / max ${pinchRatioMax.toFixed(2)})<br>` +
+      `spread + <b>M</b> = set 100% &middot; pinch + <b>N</b> = set 0%`;
+  }
+}
+
+const hands = new Hands({locateFile: (f) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}`});
+hands.setOptions({ maxNumHands: 1, modelComplexity: 1, minDetectionConfidence: 0.6, minTrackingConfidence: 0.6 });
+hands.onResults(onResults);
+
+function renderLoop() {
+  const now = performance.now();
+  const dt = (now - lastTime) / 1000;
+  lastTime = now;
+  const t = (now - startTime) / 1000;
+
+  paintSky(ctx, W, H);
+  drawClouds(ctx, clouds, W, dt);
+  drawSun(ctx, W*0.86, H*0.16, 34);
+
+  const heads = garden.updateAndDraw(ctx, rawControl, t, windForce);
+  if (garden.smoothControl > 0.7) {
+    for (const head of heads) if (Math.random() < 0.25) particles.spawnPollen(head, 1);
+  }
+  particles.update(dt);
+  particles.draw(ctx);
+
+  applyGlowAndVignette(ctx, W, H, glowCanvas, glowCtx);
+
+  requestAnimationFrame(renderLoop);
+}
+
+window.addEventListener('keydown', (e) => {
+  if (e.key === 'm' || e.key === 'M') pinchRatioMax = Math.max(pinchRatioMin+0.05, lastPinchRatio);
+  if (e.key === 'n' || e.key === 'N') pinchRatioMin = Math.min(pinchRatioMax-0.05, lastPinchRatio);
+});
+
+document.getElementById('startBtn').addEventListener('click', async () => {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 1280, height: 720 } });
+    video.srcObject = stream;
+    await video.play();
+    document.getElementById('wrap').style.display = 'block';
+    document.getElementById('startBtn').style.display = 'none';
+
+    const camera = new Camera(video, {
+      onFrame: async () => { await hands.send({ image: video }); },
+      width: 1280, height: 720
+    });
+    camera.start();
+    lastTime = performance.now();
+    startTime = performance.now();
+    requestAnimationFrame(renderLoop);
+  } catch (err) {
+    statusEl.textContent = 'Camera access failed: ' + err.message;
+    document.getElementById('wrap').style.display = 'block';
+  }
+});
+</script>
+</body>
+</html>
